@@ -1,0 +1,221 @@
+name: Build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Stamped into the exe metadata and the artifact names. Tag builds use the
+  # tag; everything else is a dev build.
+  FPS_MONITOR_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '0.0.0-dev' }}
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify vendored PresentMon
+        shell: pwsh
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/verify-vendor.ps1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Clippy (single-file feature)
+        run: cargo clippy --all-targets --features embed-assets -- -D warnings
+
+      - name: Tests
+        run: cargo test --all-targets
+
+      - name: Build release artifacts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = ($env:FPS_MONITOR_VERSION -replace "^v", "")
+          Write-Host "Building fps-monitor $version"
+
+          $dist = Join-Path (Get-Location) "dist"
+          Remove-Item $dist -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $dist | Out-Null
+
+          & cargo build --release
+          if ($LASTEXITCODE -ne 0) { throw "folder build failed" }
+
+          $folder = Join-Path $dist "fps-monitor"
+          $bin = Join-Path $folder "bin"
+          New-Item -ItemType Directory -Path $bin -Force | Out-Null
+          Copy-Item "target\release\fps-monitor.exe" $folder
+          Copy-Item "vendor\PresentMon.exe" $bin -ErrorAction Stop
+
+          @"
+          fps-monitor $version
+
+          Run fps-monitor.exe and keep the bin\ folder next to it. The only
+          external file is Intel PresentMon, used for frame-time capture.
+
+          - Accept the UAC prompt: PresentMon needs administrator rights.
+          - Use Borderless / Windowed Fullscreen in games.
+          - Config: %APPDATA%\fps-monitor\config.json
+          - Diagnostics: fps-monitor.exe --check / --selftest
+          "@ | Set-Content (Join-Path $folder "README.txt") -Encoding utf8
+
+          Compress-Archive -Path (Join-Path $folder "*") `
+              -DestinationPath (Join-Path $dist "fps-monitor-$version-win64.zip") -Force
+
+          & cargo build --release --features embed-assets
+          if ($LASTEXITCODE -ne 0) { throw "single-file build failed" }
+          Copy-Item "target\release\fps-monitor.exe" `
+              (Join-Path $dist "fps-monitor-$version-win64-single.exe") -Force
+
+          $sums = foreach ($artifact in Get-ChildItem $dist -File) {
+              $hash = (Get-FileHash $artifact.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              "{0}  {1}" -f $hash, $artifact.Name
+          }
+          $sums | Set-Content (Join-Path $dist "SHA256SUMS.txt") -Encoding ascii
+          Get-ChildItem $dist | Format-Table Name, Length -AutoSize
+
+      - name: Verify folder build (sidecar PresentMon)
+        shell: pwsh
+        run: |
+          $report = Join-Path $env:APPDATA "fps-monitor\check.txt"
+          Remove-Item $report -Force -ErrorAction SilentlyContinue
+          $exe = Join-Path (Get-Location) "dist\fps-monitor\fps-monitor.exe"
+          $stdout = Join-Path $env:TEMP "fps-check.out.txt"
+          $stderr = Join-Path $env:TEMP "fps-check.err.txt"
+          $process = Start-Process -FilePath $exe -ArgumentList "--check" `
+              -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+          if (-not $process.WaitForExit(120000)) {
+              $process.Kill()
+              throw "folder build self-check timed out"
+          }
+          if (Test-Path $report) { Get-Content $report }
+          Get-Content $stdout -ErrorAction SilentlyContinue
+          Get-Content $stderr -ErrorAction SilentlyContinue
+          if ($process.ExitCode -ne 0) {
+              throw "folder build self-check failed with exit code $($process.ExitCode)"
+          }
+
+      - name: Verify single-file build (embedded, hash-verified unpack)
+        shell: pwsh
+        run: |
+          Remove-Item (Join-Path $env:LOCALAPPDATA "fps-monitor\runtime") -Recurse -Force -ErrorAction SilentlyContinue
+          $report = Join-Path $env:APPDATA "fps-monitor\check.txt"
+          Remove-Item $report -Force -ErrorAction SilentlyContinue
+          $exe = Get-ChildItem "dist\*-single.exe" | Select-Object -First 1
+          if (-not $exe) { throw "no single-file exe produced" }
+          $stdout = Join-Path $env:TEMP "fps-single-check.out.txt"
+          $stderr = Join-Path $env:TEMP "fps-single-check.err.txt"
+          $process = Start-Process -FilePath $exe.FullName -ArgumentList "--check" `
+              -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+          if (-not $process.WaitForExit(120000)) {
+              $process.Kill()
+              throw "single-file self-check timed out"
+          }
+          if (Test-Path $report) { Get-Content $report }
+          Get-Content $stdout -ErrorAction SilentlyContinue
+          Get-Content $stderr -ErrorAction SilentlyContinue
+          if ($process.ExitCode -ne 0) {
+              throw "single-file self-check failed with exit code $($process.ExitCode)"
+          }
+          if (-not (Get-ChildItem (Join-Path $env:LOCALAPPDATA "fps-monitor\runtime") -Recurse -File)) {
+              throw "single-file build did not unpack PresentMon"
+          }
+
+      - name: UI smoke test (informational)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $exe = Join-Path (Get-Location) "dist\fps-monitor\fps-monitor.exe"
+          $process = Start-Process -FilePath $exe -ArgumentList "--ui-smoke", "--seconds", "2" `
+              -RedirectStandardOutput (Join-Path $env:TEMP "fps-ui.out.txt") `
+              -RedirectStandardError (Join-Path $env:TEMP "fps-ui.err.txt") -PassThru
+          if (-not $process.WaitForExit(60000)) {
+              $process.Kill()
+              throw "UI smoke test timed out"
+          }
+          $report = Join-Path $env:APPDATA "fps-monitor\ui-smoke.txt"
+          if (Test-Path $report) {
+              $text = Get-Content $report -Raw
+              Get-Content $report
+              if ($text -match "width before/after value change: (\d+)/(\d+)" -and $matches[1] -ne $matches[2]) {
+                  throw "overlay width changed while values changed ($($matches[1]) -> $($matches[2]))"
+              }
+          }
+          if ($process.ExitCode -ne 0) { throw "UI smoke test failed" }
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: fps-monitor
+          path: |
+            dist/*.zip
+            dist/*-single.exe
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Resolve version
+        id: version
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          "value=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: fps-monitor
+          path: release
+          merge-multiple: true
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          fail_on_unmatched_files: true
+          body: |
+            fps-monitor ${{ steps.version.outputs.value }}
+
+            **下载**
+
+            - `fps-monitor-${{ steps.version.outputs.value }}-win64.zip` - 推荐。解压后运行
+              `fps-monitor.exe`，保留 `bin\` 目录。
+            - `fps-monitor-${{ steps.version.outputs.value }}-win64-single.exe` - 单文件版。
+              首次运行把 PresentMon 解包到 `%LOCALAPPDATA%\fps-monitor\runtime`。
+
+            exe 未签名，SmartScreen 可能提示未知发布者。FPS 采集需要管理员权限。
+          files: |
+            release/*.zip
+            release/*-single.exe
+            release/SHA256SUMS.txt

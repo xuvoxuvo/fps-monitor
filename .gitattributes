@@ -1,0 +1,9 @@
+* text=auto
+
+# Keep the vendored helper binaries byte-identical on checkout; line-ending
+# conversion would break vendor/SHA256SUMS.
+*.exe binary
+*.dll binary
+*.ico binary
+*.png binary
+*.zip binary

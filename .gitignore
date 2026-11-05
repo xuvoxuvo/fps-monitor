@@ -1,0 +1,12 @@
+/target/
+/dist/
+/dist-next/
+/dist-final/
+/dist-final2/
+/dist-final3/
+/dist-final4/
+/dist-final5/
+/.testdata/
+
+# Local build/IDE noise
+*.pdb
